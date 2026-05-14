@@ -1,6 +1,8 @@
 #include <Arduino.h>
 #include <WiFi.h>
+#include <SD.h>
 #include "esp_wifi.h"
+#include <esp_err.h>
 #include <ctype.h>
 #include <string.h>
 #include <SPIFFS.h>
@@ -12,9 +14,9 @@
 #define BUZZER_PIN 3
 #define USE_BUZZER 1
 
-// Onboard user LED on Seeed XIAO ESP32-S3 is GPIO21 and is ACTIVE LOW
+// Onboard user LED on Seeed XIAO ESP32-S3 is GPIO25 and is ACTIVE LOW
 // (driving the pin LOW lights the LED).
-#define LED_PIN          21
+#define LED_PIN          25
 #define USE_LED          1
 #define LED_ACTIVE_HIGH  0
 #define LED_FLASH_MS     120
@@ -76,6 +78,10 @@ static const size_t SSID_KEYWORD_COUNT = sizeof(target_ssid_keywords) / sizeof(t
 #define FY_SESSION_TMP       "/session.tmp"
 #define FY_PREV_FILE         "/prev_session.json"
 #define AUTOSAVE_INTERVAL_MS 60000
+
+// SD Card Configuration
+#define SD_MOUNT_RETRY_MS 2000
+#define CSV_FILENAME      "/detections.csv"
 
 // ============================================================
 // TARGET OUI LIST  (all lowercase, colons only)
@@ -181,7 +187,7 @@ static bool          fySpiffsReady    = false;
 static bool          fyDirty          = false;
 static unsigned long fyLastSaveAt     = 0;
 static int           fyLastSaveCount  = 0;
-
+static bool          fysdCardReady = false;
 // ============================================================
 // STATE
 // ============================================================
@@ -212,6 +218,10 @@ static volatile unsigned long ledOffAt = 0;
 // HB_DEVICE_ACTIVE_MS the heartbeat stops until the next new detection.
 static unsigned long fyLastTargetSeen  = 0;
 static unsigned long fyLastHeartbeatAt = 0;
+
+// SD Card State
+static bool sdCardReady = false;
+static File csvFile;
 
 // ============================================================
 // 802.11 HEADER
@@ -995,6 +1005,25 @@ static void drainAlertQueue() {
     // Flask-compatible JSON line (parsed by api/flockyou.py over USB CDC).
     emitDetectionJSON(macStr, method, e.rssi, e.channel,
                       (e.type == ALERT_SSID) ? e.ssid : "");
+if (sdCardReady) {
+      File csvFile = SD.open(CSV_FILENAME, FILE_APPEND);
+      if (csvFile) {
+        char csvLine[256];
+        const char* ssidStr = (e.type == ALERT_SSID) ? e.ssid : "";
+        
+        // Format: timestamp,mac_address,detection_method,rssi,channel,ssid
+        snprintf(csvLine, sizeof(csvLine), "%lu,%s,%s,%d,%u,%s", 
+                 (unsigned long)millis(),
+                 macStr,
+                 method,
+                 (int)e.rssi,
+                 (unsigned int)e.channel,
+                 (const char*)ssidStr);
+        
+        csvFile.println(csvLine);
+        csvFile.close();
+      }
+    }
 
     // Audio feedback:
     //   - NEW MAC  → two fast ascending beeps (clearly distinct sound)
@@ -1043,14 +1072,15 @@ static void heartbeatTick() {
 // ============================================================
 
 void setup() {
+  // ============================================================
+  // 1) Initialize Serial Monitor
+  // ============================================================
   Serial.begin(115200);
-  // Crucial for USB-optional operation: without this, Serial.write() will
-  // block indefinitely on an ESP32-S3 USB-CDC port when no host is attached.
   Serial.setTxTimeoutMs(0);
-  delay(300);
+  delay(100);
 
 #if MIRROR_SERIAL
-  Serial1.begin(MIRROR_BAUD, SERIAL_8N1, -1, MIRROR_TX_PIN);  // TX-only on GPIO43
+  Serial1.begin(MIRROR_BAUD, SERIAL_8N1, -1, MIRROR_TX_PIN);
 #endif
 
 #if USE_BUZZER
@@ -1071,31 +1101,102 @@ void setup() {
   precompileOuis();
   memset(dedupeTable, 0, sizeof(dedupeTable));
 
-  // SPIFFS — format on first boot if missing. Non-fatal if it fails.
-  if (SPIFFS.begin(true)) {
+  // ============================================================
+  // 2) Initialize SPIFFS (Internal Flash) for persistence
+  // ============================================================
+  if (SPIFFS.begin(false)) {
     fySpiffsReady = true;
     dualPrintln("[flockyou] SPIFFS ready");
+    fyPromotePrevSession();
+  } else if (SPIFFS.begin(true)) {
+    fySpiffsReady = true;
+    dualPrintln("[flockyou] SPIFFS ready after format");
     fyPromotePrevSession();
   } else {
     dualPrintln("[flockyou] SPIFFS init FAILED — running without persistence");
   }
 
+  // ============================================================
+  // 3) Initialize SD Card (Expansion Board Mode) for CSV logging
+  // ============================================================
+  dualPrintln("[flockyou] Initializing SD Card on Expansion Board (GPIO 21/22/23)...");
+  
+  // Define pins for Xiao ESP32-S3 Expansion Slot
+  const int SD_CS_PIN = 21;
+  
+  dualPrintln("[flockyou] reached SD init");
+  bool sdInitOk = SD.begin(SD_CS_PIN);
+  dualPrintf("[flockyou] SD.begin returned %d\n", sdInitOk ? 1 : 0);
+  if (!sdInitOk) {
+    dualPrintln("[flockyou] SD Card Mount Failed! Check B2B connection.");
+    dualPrintln("[flockyou] Ensure card is formatted as FAT32.");
+    sdCardReady = false;
+  } else {
+    sdCardReady = true;
+    uint8_t cardType = SD.cardType();
+    if (cardType == CARD_NONE) {
+      dualPrintln("[flockyou] No SD card detected on Expansion Board.");
+      sdCardReady = false;
+    } else {
+      uint32_t cardSize = SD.cardSize() / (1024 * 1024);
+      dualPrintf("[flockyou] SD Card Mounted (Expansion)! Type: %s, Size: %d MB\n", 
+                 (cardType == CARD_SDHC) ? "SDHC" : "SD", cardSize);
+
+      // Ensure CSV file exists on SD card
+      if (!SD.exists(CSV_FILENAME)) {
+        File csvFile = SD.open(CSV_FILENAME, FILE_WRITE);
+        if (csvFile) {
+          csvFile.println("timestamp,mac_address,detection_method,rssi,channel,ssid");
+          csvFile.close();
+          dualPrintln("[flockyou] CSV header written to expansion card.");
+        } else {
+          dualPrintln("[flockyou] ERROR: Could not create CSV file.");
+          sdCardReady = false;
+        }
+      } else {
+        dualPrintln("[flockyou] CSV file found, appending data.");
+      }
+    }
+  }
+
+  // ============================================================
+  // 4) Initialize WiFi (Must come AFTER SD Card)
+  // ============================================================
   WiFi.mode(WIFI_MODE_NULL);
   wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
-  esp_wifi_init(&cfg);
-  esp_wifi_set_storage(WIFI_STORAGE_RAM);
-  esp_wifi_set_mode(WIFI_MODE_NULL);
-  esp_wifi_start();
+  esp_err_t err = esp_wifi_init(&cfg);
+  if (err != ESP_OK) {
+    dualPrintf("[flockyou] esp_wifi_init failed: %d (%s)\n", err, esp_err_to_name(err));
+    return;
+  }
+
+  err = esp_wifi_set_storage(WIFI_STORAGE_RAM);
+  if (err != ESP_OK) {
+    dualPrintf("[flockyou] esp_wifi_set_storage failed: %d (%s)\n", err, esp_err_to_name(err));
+    return;
+  }
+
+  err = esp_wifi_set_mode(WIFI_MODE_NULL);
+  if (err != ESP_OK) {
+    dualPrintf("[flockyou] esp_wifi_set_mode failed: %d (%s)\n", err, esp_err_to_name(err));
+    return;
+  }
+
+  err = esp_wifi_start();
+  if (err != ESP_OK) {
+    dualPrintf("[flockyou] esp_wifi_start failed: %d (%s)\n", err, esp_err_to_name(err));
+    return;
+  }
 
   applyInitialChannel();
 
   wifi_promiscuous_filter_t filt = {
     .filter_mask = 0
 #if PROCESS_MGMT_FRAMES
-        | WIFI_PROMIS_FILTER_MASK_MGMT
+    | WIFI_PROMIS_FILTER_MASK_MGMT
 #endif
 #if PROCESS_DATA_FRAMES
-        | WIFI_PROMIS_FILTER_MASK_DATA
+    | WIFI_PROMIS_FILTER_MASK_DATA
 #endif
   };
   esp_wifi_set_promiscuous_filter(&filt);
@@ -1104,9 +1205,12 @@ void setup() {
 
   dualPrintln("[flockyou] merged WiFi detector started");
   dualPrintf("[flockyou] mode=%s dwell_ms=%u start_channel=%u rssi_min=%d spiffs=%d\n",
-                channelModeName(), CHANNEL_DWELL_MS, currentChannel,
-                RSSI_MIN, fySpiffsReady ? 1 : 0);
+             channelModeName(), CHANNEL_DWELL_MS, currentChannel,
+             RSSI_MIN, fySpiffsReady ? 1 : 0);
 
+  // ============================================================
+  // 5) Start Main Loop
+  // ============================================================
   lastHeartbeat = millis();
   fyLastSaveAt  = millis();
 }
@@ -1117,6 +1221,6 @@ void loop() {
   autosaveTick();      // periodic SPIFFS write if dirty
   heartbeatTick();     // audible beep-pair while a target is still in range
   ledTick();           // turn off LED after LED_FLASH_MS
-  printHeartbeat();
+  printHeartbeat();    // Consider throttling this
   delay(1);
 }
