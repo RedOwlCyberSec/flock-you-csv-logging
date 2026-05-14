@@ -9,6 +9,8 @@
 > `promiscious` baseline. See "Further research" below.
 
 ---
+Note: Added function to log detections to microSD Card in CSV format. This way, detections can be logged without a secondary device running the Flask dashboard. This is specific to Seeed Studio XIAO ESP-32 S3 Sense. 
+---
 
 ## Credit
 
